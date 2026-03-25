@@ -28,5 +28,6 @@ services:
       - ./temp:/app/temp                    # 临时文件目录
       - ./cookies.json:/app/cookies.json    # 持久化 cookies
       - ./rainyun.py:/app/rainyun.py
+      - ./ICR.py:/app/ICR.py
     shm_size: '2gb'                         # Chrome 需要足够的共享内存
     restart: "no"
