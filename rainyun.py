@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import cv2
 import ddddocr
 import requests
+import ICR
 from api_client import RainyunAPI
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
@@ -161,6 +162,23 @@ XPATH_CONFIG = {
     "CAPTCHA_IMG_INSTRUCTION": (By.XPATH, "//div[@id='instruction']//img")
 }
 
+DAILY_SIGNIN_CARD_XPATH = (
+    "//div[contains(@class, 'card-header')]"
+    "[.//span[contains(normalize-space(.), '每日签到')]]"
+)
+UPSTREAM_DAILY_SIGNIN_BUTTON_XPATH = (
+    '//*[@id="app"]/div[1]/div[3]/div[2]/div/div/div[2]/div[2]/div/div/div/div[1]/div/div[1]/div/div[1]/div/span[2]/a'
+)
+DAILY_SIGNIN_BUTTON_XPATHS = [
+    DAILY_SIGNIN_CARD_XPATH + "//a[contains(normalize-space(.), '领取奖励')]",
+    DAILY_SIGNIN_CARD_XPATH + "//*[self::a or self::button][contains(normalize-space(.), '领取奖励')]",
+    "//span[contains(normalize-space(.), '每日签到')]"
+    "/ancestor::div[contains(@class, 'card-header')][1]"
+    "//*[self::a or self::button][contains(normalize-space(.), '领取奖励')]",
+    UPSTREAM_DAILY_SIGNIN_BUTTON_XPATH,
+]
+DAILY_SIGNIN_COMPLETED_PATTERNS = ["已领取", "已完成", "已签到", "明日再来"]
+
 
 def do_login(ctx: RuntimeContext, user: str, pwd: str) -> bool:
     """执行登录流程"""
@@ -295,6 +313,206 @@ def get_element_size(element) -> tuple[float, float]:
     return float(width), float(height)
 
 
+def has_valid_captcha_positions(positions: list[tuple[int, int]], expected_count: int = 3) -> bool:
+    if len(positions) != expected_count:
+        logger.warning(f"验证码识别坐标数量异常: {len(positions)}，预期 {expected_count}")
+        return False
+    if len(set(positions)) != len(positions):
+        logger.warning(f"验证码识别坐标重复: {positions}")
+        return False
+    return True
+
+
+def resolve_captcha_positions_with_icr(captcha_bytes: bytes, sprite_bytes: bytes) -> list[tuple[int, int]]:
+    logger.info("验证码识别路径: ICR")
+    try:
+        matches = ICR.main(captcha_bytes, sprite_bytes, match_method="template")
+    except Exception as error:
+        logger.warning(f"ICR 识别异常，将回退到旧逻辑: {type(error).__name__} - {error}")
+        return []
+
+    positions: list[tuple[int, int]] = []
+    for match in matches:
+        rect = match.get("bg_rect")
+        if not rect:
+            continue
+
+        x, y, width, height = rect
+        center = (int(x + width / 2), int(y + height / 2))
+        sprite_index = int(match.get("sprite_idx", len(positions))) + 1
+        similarity = match.get("similarity")
+        angle = match.get("angle")
+        if similarity is not None and angle is not None:
+            logger.info(
+                f"ICR 图案 {sprite_index} 位于 ({center[0]},{center[1]})，角度：{angle}°，相似度：{float(similarity):.2f}%"
+            )
+        else:
+            logger.info(f"ICR 图案 {sprite_index} 位于 ({center[0]},{center[1]})")
+        positions.append(center)
+
+    if has_valid_captcha_positions(positions):
+        logger.info(f"ICR 成功生成 {len(positions)} 个有效点击坐标")
+        return positions
+
+    logger.warning("ICR 识别结果无效，将回退到旧逻辑")
+    return []
+
+
+def resolve_captcha_positions_with_legacy_matcher(
+    ctx: RuntimeContext,
+    captcha,
+    captcha_bytes: bytes,
+) -> list[tuple[int, int]]:
+    logger.info("验证码识别路径: LEGACY")
+    try:
+        bboxes = ctx.det.detection(captcha_bytes) or []
+    except Exception as error:
+        logger.warning(f"旧逻辑检测异常: {type(error).__name__} - {error}")
+        return []
+
+    if not bboxes:
+        logger.warning("旧逻辑未检测到可用目标框")
+        return []
+
+    result = {}
+    for index, bbox in enumerate(bboxes):
+        x1, y1, x2, y2 = bbox
+        spec = captcha[y1:y2, x1:x2]
+        cv2.imwrite(temp_path(ctx, f"spec_{index + 1}.jpg"), spec)
+        for sprite_index in range(3):
+            similarity, _ = compute_similarity(
+                temp_path(ctx, f"sprite_{sprite_index + 1}.jpg"),
+                temp_path(ctx, f"spec_{index + 1}.jpg"),
+            )
+            similarity_key = f"sprite_{sprite_index + 1}.similarity"
+            position_key = f"sprite_{sprite_index + 1}.position"
+            current_position = f"{int((x1 + x2) / 2)},{int((y1 + y2) / 2)}"
+            if similarity_key in result:
+                if float(result[similarity_key]) < similarity:
+                    result[similarity_key] = similarity
+                    result[position_key] = current_position
+            else:
+                result[similarity_key] = similarity
+                result[position_key] = current_position
+
+    if not check_answer(result):
+        for index in range(3):
+            similarity_key = f"sprite_{index + 1}.similarity"
+            position_key = f"sprite_{index + 1}.position"
+            similarity = result.get(similarity_key, 0)
+            position = result.get(position_key, "N/A")
+            if isinstance(similarity, float):
+                logger.warning(f"旧逻辑图案 {index + 1}: 位置={position}, 匹配率={similarity:.4f}")
+            else:
+                logger.warning(f"旧逻辑图案 {index + 1}: 位置={position}, 匹配率={similarity}")
+        return []
+
+    positions: list[tuple[int, int]] = []
+    for index in range(3):
+        similarity_key = f"sprite_{index + 1}.similarity"
+        position_key = f"sprite_{index + 1}.position"
+        position = result[position_key]
+        x, y = int(position.split(",")[0]), int(position.split(",")[1])
+        positions.append((x, y))
+        logger.info(f"旧逻辑图案 {index + 1} 位于 ({position})，匹配率：{result[similarity_key]:.4f}")
+
+    if has_valid_captcha_positions(positions):
+        logger.info(f"旧逻辑成功生成 {len(positions)} 个有效点击坐标")
+        return positions
+
+    logger.warning("旧逻辑识别结果无效")
+    return []
+
+
+def click_captcha_positions(ctx: RuntimeContext, captcha, positions: list[tuple[int, int]]) -> None:
+    slide_bg = ctx.wait.until(EC.visibility_of_element_located(XPATH_CONFIG["CAPTCHA_BG"]))
+    style = slide_bg.get_attribute("style")
+    width_raw, height_raw = captcha.shape[1], captcha.shape[0]
+    try:
+        width = get_width_from_style(style)
+        height = get_height_from_style(style)
+    except ValueError:
+        width, height = get_element_size(slide_bg)
+
+    x_offset, y_offset = float(-width / 2), float(-height / 2)
+    for index, (x, y) in enumerate(positions, start=1):
+        final_x = int(x_offset + x / width_raw * width)
+        final_y = int(y_offset + y / height_raw * height)
+        logger.info(f"点击图案 {index}: 原始坐标=({x},{y}) 映射坐标=({final_x},{final_y})")
+        ActionChains(ctx.driver).move_to_element_with_offset(slide_bg, final_x, final_y).click().perform()
+
+
+def get_runtime_wait_timeout(ctx: RuntimeContext, minimum: int = 15) -> int:
+    base_timeout = int(getattr(ctx.wait, "_timeout", minimum))
+    return max(base_timeout, minimum)
+
+
+def wait_for_reward_page_ready(ctx: RuntimeContext, timeout: int | None = None) -> None:
+    effective_timeout = max(timeout or get_runtime_wait_timeout(ctx), 30)
+    logger.info(f"等待赚取积分页任务加载，超时时间: {effective_timeout} 秒")
+    reward_wait = WebDriverWait(ctx.driver, effective_timeout)
+    reward_wait.until(lambda driver: driver.execute_script("return document.readyState") == "complete")
+    reward_wait.until(
+        lambda driver: (
+            "每日签到" in driver.page_source
+            or bool(driver.find_elements(By.XPATH, DAILY_SIGNIN_CARD_XPATH))
+        )
+    )
+
+
+def find_daily_signin_button(ctx: RuntimeContext, timeout: int | None = None):
+    effective_timeout = max(timeout or get_runtime_wait_timeout(ctx), 30)
+    wait_for_reward_page_ready(ctx, effective_timeout)
+    card_headers = ctx.driver.find_elements(By.XPATH, "//div[contains(@class, 'card-header')]")
+    logger.info(f"赚取积分页卡片数量: {len(card_headers)}")
+    completed_status = detect_daily_signin_completion_status(ctx)
+    if completed_status:
+        logger.info(f"每日签到卡片当前为已完成状态: {completed_status}")
+        return None
+
+    end_time = time.time() + effective_timeout
+    while time.time() < end_time:
+        for xpath in DAILY_SIGNIN_BUTTON_XPATHS:
+            elements = ctx.driver.find_elements(By.XPATH, xpath)
+            if not elements:
+                continue
+            if xpath == UPSTREAM_DAILY_SIGNIN_BUTTON_XPATH:
+                logger.warning("每日签到按钮通过上游绝对 XPath 兜底定位成功")
+            logger.info(f"已通过选择器定位每日签到按钮: {xpath}")
+            return elements[0]
+        time.sleep(1)
+
+    return None
+
+
+def get_daily_signin_card_text(ctx: RuntimeContext) -> str:
+    cards = ctx.driver.find_elements(By.XPATH, DAILY_SIGNIN_CARD_XPATH)
+    if not cards:
+        return ""
+    return " ".join(cards[0].text.split())
+
+
+def detect_daily_signin_completion_status(ctx: RuntimeContext) -> str | None:
+    card_text = get_daily_signin_card_text(ctx)
+    if not card_text:
+        logger.warning("未找到每日签到卡片文本")
+        return None
+
+    logger.info(f"每日签到卡片文本: {card_text}")
+    for pattern in DAILY_SIGNIN_COMPLETED_PATTERNS:
+        if pattern in card_text:
+            return pattern
+    return None
+
+
+def click_signin_button(ctx: RuntimeContext, button) -> None:
+    try:
+        button.click()
+    except Exception as error:
+        logger.warning(f"常规点击签到按钮失败，尝试 JS 点击: {type(error).__name__} - {error}")
+        ctx.driver.execute_script("arguments[0].click();", button)
+
+
 def process_captcha(ctx: RuntimeContext, retry_count: int = 0):
     """
     处理验证码逻辑（循环实现，避免递归栈溢出）
@@ -333,44 +551,19 @@ def process_captcha(ctx: RuntimeContext, retry_count: int = 0):
                     raise CaptchaRetryableError("验证码图片读取失败")
                 with open(temp_path(ctx, "captcha.jpg"), 'rb') as f:
                     captcha_b = f.read()
-                bboxes = ctx.det.detection(captcha_b)
-                result = dict()
-                for i in range(len(bboxes)):
-                    x1, y1, x2, y2 = bboxes[i]
-                    spec = captcha[y1:y2, x1:x2]
-                    cv2.imwrite(temp_path(ctx, f"spec_{i + 1}.jpg"), spec)
-                    for j in range(3):
-                        similarity, matched = compute_similarity(
-                            temp_path(ctx, f"sprite_{j + 1}.jpg"),
-                            temp_path(ctx, f"spec_{i + 1}.jpg")
-                        )
-                        similarity_key = f"sprite_{j + 1}.similarity"
-                        position_key = f"sprite_{j + 1}.position"
-                        if similarity_key in result.keys():
-                            if float(result[similarity_key]) < similarity:
-                                result[similarity_key] = similarity
-                                result[position_key] = f"{int((x1 + x2) / 2)},{int((y1 + y2) / 2)}"
-                        else:
-                            result[similarity_key] = similarity
-                            result[position_key] = f"{int((x1 + x2) / 2)},{int((y1 + y2) / 2)}"
-                if check_answer(result):
-                    for i in range(3):
-                        similarity_key = f"sprite_{i + 1}.similarity"
-                        position_key = f"sprite_{i + 1}.position"
-                        positon = result[position_key]
-                        logger.info(f"图案 {i + 1} 位于 ({positon})，匹配率：{result[similarity_key]:.4f}")
-                        slide_bg = ctx.wait.until(EC.visibility_of_element_located(XPATH_CONFIG["CAPTCHA_BG"]))
-                        style = slide_bg.get_attribute("style")
-                        x, y = int(positon.split(",")[0]), int(positon.split(",")[1])
-                        width_raw, height_raw = captcha.shape[1], captcha.shape[0]
-                        try:
-                            width = get_width_from_style(style)
-                            height = get_height_from_style(style)
-                        except ValueError:
-                            width, height = get_element_size(slide_bg)
-                        x_offset, y_offset = float(-width / 2), float(-height / 2)
-                        final_x, final_y = int(x_offset + x / width_raw * width), int(y_offset + y / height_raw * height)
-                        ActionChains(ctx.driver).move_to_element_with_offset(slide_bg, final_x, final_y).click().perform()
+                with open(temp_path(ctx, "sprite.jpg"), 'rb') as f:
+                    sprite_b = f.read()
+
+                recognition_method = "ICR"
+                positions = resolve_captcha_positions_with_icr(captcha_b, sprite_b)
+                if not positions:
+                    logger.warning("ICR 未返回可用坐标，尝试旧版识别逻辑")
+                    recognition_method = "LEGACY"
+                    positions = resolve_captcha_positions_with_legacy_matcher(ctx, captcha, captcha_b)
+
+                if positions:
+                    logger.info(f"本次验证码提交使用识别路径: {recognition_method}")
+                    click_captcha_positions(ctx, captcha, positions)
                     confirm = ctx.wait.until(
                         EC.element_to_be_clickable(XPATH_CONFIG["CAPTCHA_SUBMIT"]))
                     logger.info("提交验证码")
@@ -378,18 +571,11 @@ def process_captcha(ctx: RuntimeContext, retry_count: int = 0):
                     time.sleep(5)
                     result_el = ctx.wait.until(EC.visibility_of_element_located(XPATH_CONFIG["CAPTCHA_OP"]))
                     if 'show-success' in result_el.get_attribute("class"):
-                        logger.info("验证码通过")
+                        logger.info(f"验证码通过，识别路径: {recognition_method}")
                         return True
                     else:
-                        logger.error("验证码未通过，正在重试")
+                        logger.error(f"验证码未通过，识别路径: {recognition_method}，正在重试")
                 else:
-                    # 输出匹配率信息，方便调试
-                    for i in range(3):
-                        similarity_key = f"sprite_{i + 1}.similarity"
-                        position_key = f"sprite_{i + 1}.position"
-                        sim = result.get(similarity_key, 0)
-                        pos = result.get(position_key, "N/A")
-                        logger.warning(f"图案 {i + 1}: 位置={pos}, 匹配率={sim:.4f}" if isinstance(sim, float) else f"图案 {i + 1}: 位置={pos}, 匹配率={sim}")
                     logger.error("验证码识别失败，正在重试")
             else:
                 logger.error("当前验证码识别率低，尝试刷新")
@@ -559,30 +745,27 @@ def run():
         logger.info("正在转到赚取积分页")
         ctx.driver.get(build_app_url("/account/reward/earn"))
 
-        # 检查签到状态：使用 card-header 语义化定位，彻底消除位置依赖
-        try:
-            # 使用显示等待寻找按钮
-            earn = ctx.wait.until(EC.presence_of_element_located((By.XPATH,
-                                       "//div[contains(@class, 'card-header') and .//span[contains(text(), '每日签到')]]//a[contains(text(), '领取奖励')]")))
-            logger.info("点击赚取积分")
-            earn.click()
-        except TimeoutException:
-            # 检查是否已经签到（按钮可能显示"已领取"、"已完成"等）
-            already_signed_patterns = ['已领取', '已完成', '已签到', '明日再来']
+        earn = find_daily_signin_button(ctx)
+        if earn is not None:
+            logger.info("已定位到每日签到按钮，准备点击")
+            click_signin_button(ctx, earn)
+        else:
+            completed_status = detect_daily_signin_completion_status(ctx)
+            if completed_status:
+                logger.info(f"今日已签到（每日签到卡片状态：{completed_status}），跳过签到流程")
+                try:
+                    current_points = ctx.api.get_user_points()
+                    earned = current_points - start_points
+                    logger.info(f"当前剩余积分: {current_points} (本次获得 {earned} 分) | 约为 {current_points / POINTS_TO_CNY_RATE:.2f} 元")
+                except Exception:
+                    logger.info("无法通过 API 获取当前积分信息")
+                return
+
             page_source = ctx.driver.page_source
-            for pattern in already_signed_patterns:
-                if pattern in page_source:
-                    logger.info(f"今日已签到（检测到：{pattern}），跳过签到流程")
-                    # 使用 API 获取最新积分，稳定可靠
-                    try:
-                        current_points = ctx.api.get_user_points()
-                        earned = current_points - start_points
-                        logger.info(f"当前剩余积分: {current_points} (本次获得 {earned} 分) | 约为 {current_points / POINTS_TO_CNY_RATE:.2f} 元")
-                    except Exception:
-                        logger.info("无法通过 API 获取当前积分信息")
-                    return
-            # 如果既没找到领取按钮，也没检测到已签到，说明页面结构可能变了
-            raise Exception("未找到签到按钮，且未检测到已签到状态，可能页面结构已变更")
+            logger.error(f"赚取积分页未找到每日签到入口，页面长度: {len(page_source)}")
+            if "每日签到" in page_source:
+                logger.error("页面源码包含“每日签到”文本，但未识别出可点击按钮")
+            raise Exception("未找到每日签到按钮，且未检测到每日签到已完成状态，可能页面结构已变更或页面加载过慢")
         logger.info("处理验证码")
         ctx.driver.switch_to.frame("tcaptcha_iframe_dy")
         if not process_captcha(ctx):
