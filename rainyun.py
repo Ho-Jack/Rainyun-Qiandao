@@ -102,6 +102,31 @@ def clear_temp_dir(temp_dir: str) -> None:
             os.remove(file_path)
 
 
+def build_notify_title(sign_status: str, server_result=None, other_failures=None) -> str:
+    titles = []
+
+    if sign_status == "success":
+        titles.append("领取积分成功")
+    elif sign_status == "failed":
+        titles.append("领取积分失败")
+
+    if server_result:
+        if server_result.get("renewed"):
+            titles.append("续费成功")
+        if server_result.get("renew_failed"):
+            titles.append("续费失败")
+        if server_result.get("check_error"):
+            titles.append("其他原因失败")
+
+    if other_failures:
+        titles.append("其他原因失败")
+
+    if not titles:
+        titles.append("其他原因失败")
+
+    return "/".join(dict.fromkeys(titles))
+
+
 def save_cookies(ctx: RuntimeContext):
     """保存 cookies 到文件"""
     cookies = ctx.driver.get_cookies()
@@ -671,6 +696,9 @@ def run():
     driver = None
     temp_dir = None
     debug = False
+    sign_status = "failed"
+    server_result = None
+    other_failures = []
     try:
         # 从环境变量读取配置
         timeout = int(os.environ.get("TIMEOUT", "15"))
@@ -752,6 +780,7 @@ def run():
         else:
             completed_status = detect_daily_signin_completion_status(ctx)
             if completed_status:
+                sign_status = "success"
                 logger.info(f"今日已签到（每日签到卡片状态：{completed_status}），跳过签到流程")
                 try:
                     current_points = ctx.api.get_user_points()
@@ -773,6 +802,7 @@ def run():
             logger.error(f"验证码重试次数过多，任务失败。当前页面状态: {ctx.driver.current_url}")
             raise Exception("验证码识别重试次数过多，签到失败")
         ctx.driver.switch_to.default_content()
+        sign_status = "success"
 
         # 签到成功后，通过 API 刷新积分余额
         try:
@@ -784,6 +814,8 @@ def run():
         
         logger.info("任务执行成功！")
     except Exception as e:
+        if sign_status == "success":
+            other_failures.append(str(e))
         logger.error(f"脚本执行异常终止: {e}")
 
     finally:
@@ -803,15 +835,17 @@ def run():
             logger.info("━━━━━━ 开始检查服务器状态 ━━━━━━")
             try:
                 manager = ServerManager(api_key)
-                result = manager.check_and_renew()
-                server_report = "\n\n" + manager.generate_report(result)
+                server_result = manager.check_and_renew()
+                server_report = "\n\n" + manager.generate_report(server_result)
                 logger.info("服务器检查完成")
             except Exception as e:
                 logger.error(f"服务器检查失败: {e}")
+                other_failures.append(f"服务器检查失败: {e}")
                 server_report = f"\n\n⚠️ 服务器检查失败: {e}"
         elif api_key and not ServerManager:
             # 修复：配置了 API_KEY 但模块加载失败时明确告警
             logger.error(f"已配置 RAINYUN_API_KEY 但服务器管理模块加载失败: {_server_manager_error}")
+            other_failures.append(f"服务器管理模块加载失败: {_server_manager_error}")
             server_report = f"\n\n⚠️ 服务器管理模块加载失败: {_server_manager_error}"
         elif not api_key:
             logger.info("未配置 RAINYUN_API_KEY，跳过服务器管理功能")
@@ -821,7 +855,8 @@ def run():
 
         # 4. 发送通知（签到日志 + 服务器状态，一次性推送）
         logger.info("正在发送通知...")
-        send("雨云签到", log_content + server_report)
+        notify_title = build_notify_title(sign_status, server_result, other_failures)
+        send(notify_title, log_content + server_report)
 
         # 5. 释放内存
         log_capture_string.close()

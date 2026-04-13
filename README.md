@@ -7,7 +7,7 @@
 - ✅ 每日自动签到（验证码识别）
 - ✅ 服务器到期检查
 - ✅ 积分自动续费（到期前 7 天自动续费）
-- ✅ Server酱 / Bark 等多渠道通知
+- ✅ xx-tui / Server酱 / Bark 等多渠道通知
 - ✅ Docker 容器化部署
 
 ## 快速开始
@@ -38,6 +38,9 @@ docker-compose up --build
 
 | 变量名 | 必填 | 默认值 | 说明 |
 |--------|------|--------|------|
+| XXTUI_API_KEY | ❌ | - | xx-tui 推送 API Key |
+| XXTUI_CHANNEL | ❌ | WX_MP | xx-tui 推送渠道 |
+| XXTUI_FROM | ❌ | 雨云 | xx-tui 推送来源 |
 | PUSH_KEY | ❌ | - | Server酱推送密钥 |
 | BARK_PUSH | ❌ | - | Bark 推送地址/设备码 |
 | TG_BOT_TOKEN | ❌ | - | Telegram 机器人 token |
@@ -45,6 +48,7 @@ docker-compose up --build
 
 > ℹ️ 只要配置了对应 key/必要字段即会启用，可同时配置多个；完整列表见 `.env.example` 的「推送服务」分组。
 > 只需在 `.env` 中填写即可，`docker-compose.yml` 已通过 `env_file` 自动加载，无需逐条写到 `environment`。
+> ℹ️ `xx-tui` 默认使用 `WX_MP` 渠道，推送来源默认 `雨云`，通知标题会按结果自动生成：`领取积分成功`、`续费成功`、`领取积分失败`、`续费失败`、`其他原因失败`。
 
 ### 自动续费（可选）
 

@@ -39,6 +39,11 @@ def print(text, *args, **kw):
 push_config = {
     'HITOKOTO': True,                  # 启用一言（随机句子）
 
+    'XXTUI_API_KEY': '',               # xx-tui 的 API Key
+    'XXTUI_FROM': '雨云',              # xx-tui 推送来源
+    'XXTUI_CHANNEL': 'WX_MP',         # xx-tui 推送渠道，默认微信公众号
+    'XXTUI_URL': '',                   # xx-tui 自定义推送地址，留空则自动拼接官方地址
+
     'BARK_PUSH': '',                    # bark IP 或设备码，例：https://api.day.app/DxHcxxxxxRxxxxxxcm/
     'BARK_ARCHIVE': '',                 # bark 推送是否存档
     'BARK_GROUP': '',                   # bark 推送分组
@@ -234,6 +239,43 @@ def console(title: str, content: str) -> None:
     使用 控制台 推送消息。
     """
     print(f"{title}\n\n{content}")
+
+
+def xxtui(title: str, content: str) -> None:
+    """
+    使用 xx-tui 推送消息。
+    """
+    if not push_config.get("XXTUI_API_KEY"):
+        return
+    logger.info("xx-tui 服务启动")
+
+    url = push_config.get("XXTUI_URL") or f'https://www.xxtui.com/xxtui/{push_config.get("XXTUI_API_KEY")}'
+    data = {
+        "title": str(title)[:20],
+        "content": str(content)[:2500],
+        "from": str(push_config.get("XXTUI_FROM") or "雨云")[:20],
+        "channel": push_config.get("XXTUI_CHANNEL") or "WX_MP",
+    }
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        response = post_with_retry(url, json=data, headers=headers, timeout=15)
+        if response.status_code != 200:
+            logger.error(f"xx-tui 推送失败！状态码: {response.status_code} 响应: {response.text}")
+            return
+
+        try:
+            response_data = response.json()
+        except ValueError:
+            response_data = None
+
+        if isinstance(response_data, dict) and response_data.get("code") not in (None, 0, 200, "0", "200"):
+            logger.error(f"xx-tui 推送失败！响应: {response_data}")
+            return
+
+        logger.info("xx-tui 推送成功！")
+    except Exception as e:
+        logger.error(f"xx-tui 推送异常: {e}")
 
 
 def dingding_bot(title: str, content: str) -> None:
@@ -1094,6 +1136,8 @@ def one() -> str:
 
 def add_notify_function():
     notify_function = []
+    if push_config.get("XXTUI_API_KEY"):
+        notify_function.append(xxtui)
     if push_config.get("BARK_PUSH"):
         notify_function.append(bark)
     if _as_bool(push_config.get("CONSOLE"), default=False):

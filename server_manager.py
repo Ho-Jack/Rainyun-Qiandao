@@ -138,16 +138,20 @@ class ServerManager:
                 "points": 当前积分,
                 "servers": [服务器状态列表],
                 "renewed": [续费成功的服务器],
+                "renew_failed": [续费失败的服务器或原因],
                 "warnings": [警告信息],
-                "points_warning": 积分预警信息（如果有）
+                "points_warning": 积分预警信息（如果有）,
+                "check_error": 接口检查失败原因（如果有）
             }
         """
         result = {
             "points": 0,
             "servers": [],
             "renewed": [],
+            "renew_failed": [],
             "warnings": [],
-            "points_warning": None
+            "points_warning": None,
+            "check_error": None,
         }
 
         try:
@@ -215,10 +219,12 @@ class ServerManager:
                                 result["renewed"].append(server.name)
                             except RainyunAPIError as e:
                                 logger.error(f"❌ {server.name} 续费失败: {e}")
+                                result["renew_failed"].append(f"{server.name} 续费失败: {e}")
                                 result["warnings"].append(f"{server.name} 续费失败: {e}")
                         else:
                             warning = f"积分不足！{server.name} 需要 {server.renew_price}，当前 {result['points']}"
                             logger.warning(warning)
+                            result["renew_failed"].append(warning)
                             result["warnings"].append(warning)
                     else:
                         result["warnings"].append(f"{server.name} 即将到期，但自动续费已关闭")
@@ -227,6 +233,7 @@ class ServerManager:
 
         except RainyunAPIError as e:
             logger.error(f"服务器检查失败: {e}")
+            result["check_error"] = str(e)
             result["warnings"].append(f"API 调用失败: {e}")
 
         return result
